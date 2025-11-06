@@ -29,7 +29,8 @@ python -m venv .venv
 # Windows PowerShell:
 .\.venv\Scripts\Activate.ps1
 # Linux/macOS:
-source .venv/bin/activate ```
+source .venv/bin/activate
+
 
 pip install -r requirements.txt
 cp .env.example .env
@@ -40,14 +41,16 @@ cp .env.example .env
 # DATA_DIR=./data
 
 python bot.py
-
-🔐 Переменные окружения (.env)
+```
+## 🔐 Переменные окружения (.env)
+```bash
 BOT_TOKEN=PASTE_YOUR_TOKEN_HERE
 OWNER_ID=000000000
 ADMIN_IDS=
 DATA_DIR=./data
-
-🚀 Деплой на Ubuntu (systemd)
+```
+## 🚀 Деплой на Ubuntu (systemd)
+```bash
 sudo apt update && sudo apt install -y python3.12 python3.12-venv git
 git clone https://github.com/vkvkf/Telegram-Posting-Helper-Bot.git /root/telegrambot
 cd /root/telegrambot
@@ -81,20 +84,23 @@ sudo systemctl enable telegrambot
 sudo systemctl start telegrambot
 sudo systemctl status telegrambot
 journalctl -u telegrambot -f   # выйти: Ctrl+C
-
-🔁 Обновления на сервере
+```
+## 🔁 Обновления на сервере
+```bash
 cd /root/telegrambot
 git pull
 source .venv/bin/activate
 pip install -r requirements.txt
 sudo systemctl restart telegrambot
-
-🧰 Частые проблемы
+```
+## 🧰 Частые проблемы
+```bash
 Бот не постит в канал — добавь бота админом канала.
 Нет storage.json — создастся автоматически при первом запуске (или в папке DATA_DIR).
 message is not modified — учтено в коде через безопасный edit_text.
 Windows PowerShell ругается на скрипты — Set-ExecutionPolicy -Scope CurrentUser RemoteSigned.
-
-📝 Лицензия
+```
+## 📝 Лицензия
+```bash
 Этот проект распространяется под лицензией MIT License.
-
+```
