@@ -1,0 +1,21 @@
+# venv
+.venv/
+venv/
+ENV/
+env/
+
+# python
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+
+# Логи/кэш
+*.log
+
+# Данные бота (секреты, база)
+.env
+storage.json
+data/
