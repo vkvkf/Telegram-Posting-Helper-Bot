@@ -161,14 +161,20 @@ def admin_only(uid: int) -> bool:
     return is_owner(uid) or is_admin(uid)
 
 async def safe_edit_text(msg: Message, text: str, **kwargs):
-    """Лечим 'message is not modified'."""
+    """Редактируем сообщение; если нельзя — отправляем новое. Лечим 'message is not modified'."""
     try:
         await msg.edit_text(text, **kwargs)
     except TelegramBadRequest as e:
-        if "message is not modified" in str(e):
-            await msg.edit_text(text + "\u200B", **kwargs)
-        else:
-            raise
+        err = str(e).lower()
+        if "message is not modified" in err:
+            try:
+                await msg.edit_text(text + "\u200B", **kwargs)
+                return
+            except TelegramBadRequest:
+                pass
+        # если нельзя редактировать или другая ошибка — отправим новое
+        await msg.answer(text, **kwargs)
+
 
 def back_menu_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
@@ -666,32 +672,82 @@ async def finalize_template(state: FSMContext, matrix: List[List[Dict[str, str]]
     save_storage(storage)
     await state.clear()
 
-# Удаление (payload = base64(json([game, cheat, name])))
-@dp.callback_query(F.data == "m:del")
-async def delete_template_start(c: CallbackQuery):
-    tpls = storage.get("templates", {})
-    if not tpls:
-        return await c.answer("📂 Нет сохранённых шаблонов", show_alert=True)
+# ----------------------------- УДАЛЕНИЕ ШАБЛОНОВ (с пагинацией) ----------------------------- #
+PAGE_SIZE = 20  # сколько шаблонов показывать на странице
+pending_deletes: Dict[int, List[Tuple[str, str, str]]] = {}
 
-    kb = InlineKeyboardBuilder()
+def _collect_templates_flat() -> List[Tuple[str, str, str]]:
+    out: List[Tuple[str, str, str]] = []
+    tpls = storage.get("templates", {})
     for g, cheats in tpls.items():
         for ch, names in cheats.items():
             for n in names.keys():
-                payload = base64.urlsafe_b64encode(json.dumps([g, ch, n]).encode("utf-8")).decode("ascii")
-                kb.button(text=f"{g} / {ch} / {n}", callback_data=f"m:delete:{payload}")
-    kb.button(text="⬅️ Назад", callback_data="menu:manage")
+                out.append((g, ch, n))
+    return out
+
+def _delete_menu_page(user_id: int, page: int) -> InlineKeyboardMarkup:
+    items = pending_deletes.get(user_id, [])
+    total = len(items)
+    max_page = max(0, (total - 1) // PAGE_SIZE) if total else 0
+    page = max(0, min(page, max_page))
+    start = page * PAGE_SIZE
+    end = min(start + PAGE_SIZE, total)
+    kb = InlineKeyboardBuilder()
+    for idx in range(start, end):
+        g, ch, n = items[idx]
+        kb.button(text=f"{g} / {ch} / {n}", callback_data=f"m:delete:{idx}")
+    nav = InlineKeyboardBuilder()
+    if page > 0:
+        nav.button(text="⬅️ Назад", callback_data=f"m:delp:{page-1}")
+    nav.button(text=f"Стр. {page+1}/{max_page+1 if total else 1}", callback_data="noop")
+    if page < max_page:
+        nav.button(text="Вперёд ➡️", callback_data=f"m:delp:{page+1}")
+    exit_kb = InlineKeyboardBuilder()
+    exit_kb.button(text="🏁 Выйти", callback_data="menu:manage")
     kb.adjust(1)
-    await safe_edit_text(c.message, "🗑 Выбери шаблон для удаления:", reply_markup=kb.as_markup())
+    nav.adjust(3)
+    exit_kb.adjust(1)
+    full = InlineKeyboardMarkup(inline_keyboard=[*kb.export(), *nav.export(), *exit_kb.export()])
+    return full
+
+@dp.callback_query(F.data == "m:del")
+async def delete_template_start(c: CallbackQuery):
+    items = _collect_templates_flat()
+    if not items:
+        return await c.answer("📂 Нет сохранённых шаблонов", show_alert=True)
+    pending_deletes[c.from_user.id] = items
+    await safe_edit_text(
+        c.message,
+        f"🗑 Выбери шаблон для удаления:\nВсего: <b>{len(items)}</b>",
+        reply_markup=_delete_menu_page(c.from_user.id, page=0)
+    )
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("m:delp:"))
+async def delete_template_page(c: CallbackQuery):
+    try:
+        page = int(c.data.split(":")[2])
+    except Exception:
+        page = 0
+    if c.from_user.id not in pending_deletes:
+        pending_deletes[c.from_user.id] = _collect_templates_flat()
+    await safe_edit_text(
+        c.message,
+        f"🗑 Выбери шаблон для удаления:\nВсего: <b>{len(pending_deletes[c.from_user.id])}</b>",
+        reply_markup=_delete_menu_page(c.from_user.id, page=page)
+    )
     await c.answer()
 
 @dp.callback_query(F.data.startswith("m:delete:"))
 async def delete_template_confirm(c: CallbackQuery):
-    b64 = c.data.split(":", 2)[-1]
+    items = pending_deletes.get(c.from_user.id, [])
     try:
-        g, ch, n = json.loads(base64.urlsafe_b64decode(b64.encode("ascii")))
+        idx = int(c.data.split(":")[2])
     except Exception:
-        return await c.answer("❌ Ошибка формата", show_alert=True)
-
+        return await c.answer("❌ Неверный индекс", show_alert=True)
+    if idx < 0 or idx >= len(items):
+        return await c.answer("❌ Элемент не найден (возможно список изменился)", show_alert=True)
+    g, ch, n = items[idx]
     try:
         del storage["templates"][g][ch][n]
         if not storage["templates"][g][ch]:
@@ -699,12 +755,20 @@ async def delete_template_confirm(c: CallbackQuery):
         if not storage["templates"][g]:
             del storage["templates"][g]
         save_storage(storage)
-        await c.answer("✅ Шаблон удалён", show_alert=True)
-        await safe_edit_text(c.message, "🧩 Управление шаблонами:", reply_markup=manage_menu())
     except KeyError:
-        await c.answer("❌ Не найден (возможно уже удалён)", show_alert=True)
+        pass
+    items = _collect_templates_flat()
+    pending_deletes[c.from_user.id] = items
+    await c.answer("✅ Шаблон удалён", show_alert=True)
+    page = (idx // PAGE_SIZE) if items else 0
+    max_page = max(0, (max(len(items), 1) - 1) // PAGE_SIZE)
+    page = min(page, max_page)
+    await safe_edit_text(
+        c.message,
+        f"🧩 Управление шаблонами — удаление\nОсталось: <b>{len(items)}</b>",
+        reply_markup=_delete_menu_page(c.from_user.id, page=page)
+    )
 
-# Список (Game -> Cheat -> name1, name2)
 @dp.callback_query(F.data == "m:list")
 async def list_templates(c: CallbackQuery):
     tpls = storage.get("templates", {})
