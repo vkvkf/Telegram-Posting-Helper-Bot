@@ -3,17 +3,19 @@
 - Роли: Владелец (OWNER) и админы.
 - У каждого админа свой канал (показывается "Название (ID)").
 - Посты: текст (HTML) + фото + многорядные веб-кнопки.
-- Шаблоны: добавление/удаление/список/предпросмотр/отправка.
-- Экспорт/Импорт шаблонов: JSON (в меню "🧩 Управление шаблонами").
+- Шаблоны: ПЕРСОНАЛЬНЫЕ для каждого пользователя (user_id namespace).
+- Экспорт/Импорт шаблонов: только в рамках текущего пользователя.
 - Подключение канала: переслать пост или указать @username.
 - Безопасный edit_text.
 - storage.json создаётся автоматически (рядом с bot.py или в DATA_DIR).
+- Миграция: если найден старый глобальный формат шаблонов (общий для всех),
+  он переносится в пространство владельца (OWNER_ID), а если не задан — в "0".
+- Аудит-лог (только OWNER): последние 20 действий всех пользователей.
 
-Требования: Python 3.12+, aiogram 3.13+
+Требования: Python 3.12+, aiogram 3.13+, python-dotenv
 """
 
 import asyncio
-import base64
 import html
 import json
 import os
@@ -22,6 +24,7 @@ from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timezone
 
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
@@ -47,22 +50,31 @@ from dotenv import load_dotenv
 BASE_DIR = Path(os.getenv("DATA_DIR") or Path(__file__).resolve().parent)
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 STORAGE_FILE = BASE_DIR / "storage.json"
+AUDIT_FILE   = BASE_DIR / "audit.log"
 
 DEFAULT_STORAGE = {
     "admins": [],           # [user_id]
     "channels": {},         # {str(user_id): channel_id}
     "channel_titles": {},   # {str(user_id): "Title (id)"}
-    "templates": {}         # {game: {cheat: {name: {text, photo, buttons}}}}
+    # Новый формат: "templates" -> {str(user_id): {game: {cheat: {name: {text, photo, buttons}}}}}
+    "templates": {}
 }
 
 def load_storage() -> dict:
     if STORAGE_FILE.exists():
         try:
-            return json.loads(STORAGE_FILE.read_text(encoding="utf-8"))
+            data = json.loads(STORAGE_FILE.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                data = {}
         except Exception:
-            pass
-    STORAGE_FILE.write_text(json.dumps(DEFAULT_STORAGE, ensure_ascii=False, indent=2), encoding="utf-8")
-    return json.loads(STORAGE_FILE.read_text(encoding="utf-8"))
+            data = {}
+    else:
+        data = {}
+
+    for k, v in DEFAULT_STORAGE.items():
+        if k not in data:
+            data[k] = v if not isinstance(v, (dict, list)) else ({} if isinstance(v, dict) else [])
+    return data
 
 def save_storage(data: dict) -> None:
     """Атомная запись, чтобы не бить файл при сбоях."""
@@ -79,6 +91,31 @@ def save_storage(data: dict) -> None:
                 os.remove(tmp_path)
         except Exception:
             pass
+
+
+# ----------------------------- АУДИТ ----------------------------- #
+
+def _ts() -> str:
+    # локальное время по системе с минутной точностью
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+def log_action(uid: int, text: str) -> None:
+    """Пишем одну строку в audit.log: [YYYY-mm-dd HH:MM] <uid> - text"""
+    try:
+        line = f"[{_ts()}] {uid} - {text}\n"
+        with AUDIT_FILE.open("a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
+
+def tail_audit(n: int = 20) -> List[str]:
+    if not AUDIT_FILE.exists():
+        return []
+    try:
+        lines = AUDIT_FILE.read_text(encoding="utf-8", errors="ignore").splitlines()
+        return lines[-n:]
+    except Exception:
+        return []
 
 
 # ----------------------------- МОДЕЛИ ----------------------------- #
@@ -133,11 +170,31 @@ class ImportTemplatesStates(StatesGroup):
 # ----------------------------- ИНИЦИАЛИЗАЦИЯ ----------------------------- #
 
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or ""
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
 
 storage = load_storage()
+
+# миграция: если "templates" не в per-user формате, заворачиваем в OWNER_ID (или "0")
+def _looks_like_user_key(k: str) -> bool:
+    s = k.lstrip("-")
+    return s.isdigit() and len(s) >= 5
+
+def migrate_templates_per_user():
+    tpls = storage.get("templates", {})
+    if not tpls:
+        return
+    if not all(_looks_like_user_key(k) for k in tpls.keys()):
+        ns = str(OWNER_ID) if OWNER_ID else "0"
+        storage["templates"] = {ns: tpls}
+        save_storage(storage)
+migrate_templates_per_user()
+
+def tpls_of(uid: int) -> Dict[str, dict]:
+    return storage.setdefault("templates", {}).setdefault(str(uid), {})
+
+# зафиксировать список админов
 seed_admins = set(storage.get("admins", [])) | set(ADMIN_IDS)
 if OWNER_ID:
     seed_admins.add(OWNER_ID)
@@ -161,7 +218,6 @@ def admin_only(uid: int) -> bool:
     return is_owner(uid) or is_admin(uid)
 
 async def safe_edit_text(msg: Message, text: str, **kwargs):
-    """Редактируем сообщение; если нельзя — отправляем новое. Лечим 'message is not modified'."""
     try:
         await msg.edit_text(text, **kwargs)
     except TelegramBadRequest as e:
@@ -172,9 +228,7 @@ async def safe_edit_text(msg: Message, text: str, **kwargs):
                 return
             except TelegramBadRequest:
                 pass
-        # если нельзя редактировать или другая ошибка — отправим новое
         await msg.answer(text, **kwargs)
-
 
 def back_menu_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
@@ -193,7 +247,8 @@ def main_menu_kb(uid: int) -> InlineKeyboardMarkup:
     kb.button(text=f"⚙️ Канал: {channel_label_for_user(uid)}", callback_data="menu:settings")
     if is_owner(uid):
         kb.button(text="👥 Админы и каналы", callback_data="owner:panel")
-    kb.adjust(2, 2)
+        kb.button(text="🧾 Аудит-лог действий", callback_data="owner:audit")  # NEW
+    kb.adjust(2, 2, 2 if is_owner(uid) else 0)
     return kb.as_markup()
 
 def settings_menu_kb(uid: int) -> InlineKeyboardMarkup:
@@ -206,6 +261,7 @@ def settings_menu_kb(uid: int) -> InlineKeyboardMarkup:
         kb.button(text="👤 Добавить админа", callback_data="set:add_admin")
         kb.button(text="🗑 Удалить админа", callback_data="set:del_admin")
         kb.button(text="📜 Список админов", callback_data="set:list_admins")
+        kb.button(text="🧾 Аудит-лог", callback_data="owner:audit")  # NEW
     kb.button(text="⬅️ В меню", callback_data="menu:back")
     kb.adjust(1, 2, 1, 2, 1)
     return kb.as_markup()
@@ -232,35 +288,58 @@ def build_matrix_preview(buttons: List[List[Button]]) -> str:
         lines.append(f"Ряд {i}: " + " | ".join(cols))
     return "\n".join(lines)
 
-def templates_menu() -> InlineKeyboardMarkup:
+# ---------- Индексация путей, чтобы callback_data были короткими ---------- #
+
+def list_games(uid: int) -> List[str]:
+    return sorted(tpls_of(uid).keys(), key=str.lower)
+
+def list_cheats(uid: int, gidx: int) -> List[str]:
+    games = list_games(uid)
+    if gidx < 0 or gidx >= len(games):
+        return []
+    game = games[gidx]
+    return sorted(tpls_of(uid)[game].keys(), key=str.lower)
+
+def list_names(uid: int, gidx: int, cidx: int) -> List[str]:
+    games = list_games(uid)
+    if gidx < 0 or gidx >= len(games):
+        return []
+    game = games[gidx]
+    cheats = list_cheats(uid, gidx)
+    if cidx < 0 or cidx >= len(cheats):
+        return []
+    cheat = cheats[cidx]
+    return sorted(tpls_of(uid)[game][cheat].keys(), key=str.lower)
+
+def templates_menu(uid: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    for game in storage.get("templates", {}):
-        kb.button(text=game, callback_data=f"tpl:g:{game}")
+    for i, game in enumerate(list_games(uid)):
+        kb.button(text=game[:64], callback_data=f"tpl:g#{i}")
     kb.button(text="⬅️ В меню", callback_data="menu:back")
     kb.adjust(2)
     return kb.as_markup()
 
-def cheats_menu(game: str) -> InlineKeyboardMarkup:
+def cheats_menu(uid: int, gidx: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    for cheat in storage.get("templates", {}).get(game, {}):
-        kb.button(text=cheat, callback_data=f"tpl:c:{game}:{cheat}")
+    for i, cheat in enumerate(list_cheats(uid, gidx)):
+        kb.button(text=cheat[:64], callback_data=f"tpl:c#{gidx}#{i}")
     kb.button(text="⬅️ Назад", callback_data="tpl:back:games")
     kb.adjust(2)
     return kb.as_markup()
 
-def templates_list_menu(game: str, cheat: str) -> InlineKeyboardMarkup:
+def names_menu(uid: int, gidx: int, cidx: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    for name in storage.get("templates", {}).get(game, {}).get(cheat, {}):
-        kb.button(text=name, callback_data=f"tpl:n:{game}:{cheat}:{name}")
-    kb.button(text="⬅️ Назад", callback_data=f"tpl:back:cheats:{game}")
+    for i, name in enumerate(list_names(uid, gidx, cidx)):
+        kb.button(text=name[:64], callback_data=f"tpl:n#{gidx}#{cidx}#{i}")
+    kb.button(text="⬅️ Назад", callback_data=f"tpl:back:cheats#{gidx}")
     kb.adjust(2)
     return kb.as_markup()
 
-def template_view_kb(game: str, cheat: str, name: str) -> InlineKeyboardMarkup:
+def template_view_kb_by_idx(gidx: int, cidx: int, nidx: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text="🔍 Предпросмотр", callback_data=f"tpl:prev:{game}:{cheat}:{name}")
-    kb.button(text="📤 Отправить в канал", callback_data=f"tpl:send:{game}:{cheat}:{name}")
-    kb.button(text="⬅️ Назад", callback_data=f"tpl:back:templates:{game}:{cheat}")
+    kb.button(text="🔍 Предпросмотр", callback_data=f"tpl:prev#{gidx}#{cidx}#{nidx}")
+    kb.button(text="📤 Отправить в канал", callback_data=f"tpl:send#{gidx}#{cidx}#{nidx}")
+    kb.button(text="⬅️ Назад", callback_data=f"tpl:back:templates#{gidx}#{cidx}")
     kb.adjust(2, 1)
     return kb.as_markup()
 
@@ -431,11 +510,11 @@ async def add_btn_text(m: Message, state: FSMContext):
 
 @dp.message(ComposeStates.ADD_BUTTON_URL)
 async def add_btn_url(m: Message, state: FSMContext):
-    data = await state.get_data()
-    text = data.get("btn_text", "")
     url = (m.text or "").strip()
     if not (url.startswith("http://") or url.startswith("https://")):
         return await m.answer("❌ URL должен начинаться с http:// или https://")
+    data = await state.get_data()
+    text = data.get("btn_text", "")
 
     d = user_drafts.get(m.from_user.id, Draft())
     if not d.buttons:
@@ -461,70 +540,103 @@ async def send_post_to_channel(c: CallbackQuery, d: Draft):
             await bot.send_photo(chat_id=ch, photo=d.photo, caption=d.text, reply_markup=d.as_markup())
         else:
             await bot.send_message(chat_id=ch, text=d.text, reply_markup=d.as_markup())
+        log_action(c.from_user.id, "Отправил пост в свой канал (из черновика)")
         await c.answer("✅ Отправлено в твой канал!", show_alert=True)
     except Exception as e:
         await c.answer(f"❌ Ошибка отправки: {e}", show_alert=True)
 
 
-# ----------------------------- ГОТОВЫЕ ПОСТЫ ----------------------------- #
+# ----------------------------- ГОТОВЫЕ ПОСТЫ (персональные, короткий callback) ----------------------------- #
 
 @dp.callback_query(F.data == "menu:ready")
 async def ready_root(c: CallbackQuery):
-    if not storage.get("templates"):
+    if not tpls_of(c.from_user.id):
         return await c.answer("📂 Нет сохранённых шаблонов", show_alert=True)
-    await safe_edit_text(c.message, "📚 Выбери игру:", reply_markup=templates_menu())
-    await c.answer()
-
-@dp.callback_query(F.data.startswith("tpl:g:"))
-async def ready_choose_game(c: CallbackQuery):
-    game = c.data.split(":")[2]
-    await safe_edit_text(c.message, f"🎮 <b>{game}</b>\nВыбери чит:", reply_markup=cheats_menu(game))
-    await c.answer()
-
-@dp.callback_query(F.data.startswith("tpl:c:"))
-async def ready_choose_cheat(c: CallbackQuery):
-    _, _, game, cheat = c.data.split(":")
-    await safe_edit_text(
-        c.message,
-        f"🎮 <b>{game}</b> → 💾 <b>{cheat}</b>\nВыбери шаблон:",
-        reply_markup=templates_list_menu(game, cheat)
-    )
-    await c.answer()
-
-@dp.callback_query(F.data.startswith("tpl:n:"))
-async def ready_choose_name(c: CallbackQuery):
-    _, _, game, cheat, name = c.data.split(":")
-    t = storage["templates"][game][cheat][name]
-    text = t.get("text", "")
-    await safe_edit_text(c.message, f"Шаблон: {game} / {cheat} / {name}\n\n{text}",
-                         reply_markup=template_view_kb(game, cheat, name))
+    await safe_edit_text(c.message, "📚 Выбери игру:", reply_markup=templates_menu(c.from_user.id))
     await c.answer()
 
 @dp.callback_query(F.data == "tpl:back:games")
 async def back_to_games(c: CallbackQuery):
-    await safe_edit_text(c.message, "📚 Выбери игру:", reply_markup=templates_menu())
+    await safe_edit_text(c.message, "📚 Выбери игру:", reply_markup=templates_menu(c.from_user.id))
     await c.answer()
 
-@dp.callback_query(F.data.startswith("tpl:back:cheats:"))
+@dp.callback_query(F.data.startswith("tpl:g#"))
+async def choose_game(c: CallbackQuery):
+    try:
+        gidx = int(c.data.split("#")[1])
+    except Exception:
+        return await c.answer("Некорректные данные", show_alert=True)
+    await safe_edit_text(c.message, "🎮 Выбери чит:", reply_markup=cheats_menu(c.from_user.id, gidx))
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("tpl:back:cheats#"))
 async def back_to_cheats(c: CallbackQuery):
-    game = c.data.split(":")[3]
-    await safe_edit_text(c.message, f"🎮 <b>{game}</b>\nВыбери чит:", reply_markup=cheats_menu(game))
+    try:
+        gidx = int(c.data.split("#")[1])
+    except Exception:
+        return await c.answer("Некорректные данные", show_alert=True)
+    await safe_edit_text(c.message, "🎮 Выбери чит:", reply_markup=cheats_menu(c.from_user.id, gidx))
     await c.answer()
 
-@dp.callback_query(F.data.startswith("tpl:back:templates:"))
-async def back_to_templates(c: CallbackQuery):
-    _, _, _, game, cheat = c.data.split(":")
+@dp.callback_query(F.data.startswith("tpl:c#"))
+async def choose_cheat(c: CallbackQuery):
+    try:
+        _, payload = c.data.split("#", 1)
+        gidx_s, cidx_s = payload.split("#")
+        gidx, cidx = int(gidx_s), int(cidx_s)
+    except Exception:
+        return await c.answer("Некорректные данные", show_alert=True)
+    await safe_edit_text(c.message, "💾 Выбери шаблон:", reply_markup=names_menu(c.from_user.id, gidx, cidx))
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("tpl:n#"))
+async def choose_name(c: CallbackQuery):
+    uid = c.from_user.id
+    try:
+        _, payload = c.data.split("#", 1)
+        gidx_s, cidx_s, nidx_s = payload.split("#")
+        gidx, cidx, nidx = int(gidx_s), int(cidx_s), int(nidx_s)
+    except Exception:
+        return await c.answer("Некорректные данные", show_alert=True)
+
+    games = list_games(uid)
+    cheats = list_cheats(uid, gidx)
+    names = list_names(uid, gidx, cidx)
+    if not games or not cheats or not names:
+        return await c.answer("Не найдено", show_alert=True)
+
+    game = games[gidx]
+    cheat = cheats[cidx]
+    name = names[nidx]
+    t = tpls_of(uid)[game][cheat][name]
+    text = t.get("text", "")
     await safe_edit_text(
         c.message,
-        f"🎮 <b>{game}</b> → 💾 <b>{cheat}</b>\nВыбери шаблон:",
-        reply_markup=templates_list_menu(game, cheat)
+        f"Шаблон: {html.escape(game)} / {html.escape(cheat)} / {html.escape(name)}\n\n{text}",
+        reply_markup=template_view_kb_by_idx(gidx, cidx, nidx)
     )
     await c.answer()
 
-@dp.callback_query(F.data.startswith("tpl:prev:"))
+@dp.callback_query(F.data.startswith("tpl:prev#"))
 async def tpl_preview(c: CallbackQuery):
-    _, _, game, cheat, name = c.data.split(":")
-    t = storage["templates"][game][cheat][name]
+    uid = c.from_user.id
+    try:
+        _, payload = c.data.split("#", 1)
+        gidx_s, cidx_s, nidx_s = payload.split("#")
+        gidx, cidx, nidx = int(gidx_s), int(cidx_s), int(nidx_s)
+    except Exception:
+        return await c.answer("Некорректные данные", show_alert=True)
+
+    games = list_games(uid)
+    cheats = list_cheats(uid, gidx)
+    names = list_names(uid, gidx, cidx)
+    if not games or not cheats or not names:
+        return await c.answer("Не найдено", show_alert=True)
+
+    game = games[gidx]
+    cheat = cheats[cidx]
+    name = names[nidx]
+    t = tpls_of(uid)[game][cheat][name]
     text = t.get("text", "")
     photo = t.get("photo")
     buttons = t.get("buttons", [])
@@ -535,13 +647,29 @@ async def tpl_preview(c: CallbackQuery):
         await c.message.answer(text, reply_markup=kb)
     await c.answer("Предпросмотр отправлен выше")
 
-@dp.callback_query(F.data.startswith("tpl:send:"))
+@dp.callback_query(F.data.startswith("tpl:send#"))
 async def tpl_send(c: CallbackQuery):
-    ch = storage.get("channels", {}).get(str(c.from_user.id))
+    uid = c.from_user.id
+    ch = storage.get("channels", {}).get(str(uid))
     if not ch:
         return await c.answer("⚠️ Сначала подключи свой канал в ⚙️ Настройках", show_alert=True)
-    _, _, game, cheat, name = c.data.split(":")
-    t = storage["templates"][game][cheat][name]
+    try:
+        _, payload = c.data.split("#", 1)
+        gidx_s, cidx_s, nidx_s = payload.split("#")
+        gidx, cidx, nidx = int(gidx_s), int(cidx_s), int(nidx_s)
+    except Exception:
+        return await c.answer("Некорректные данные", show_alert=True)
+
+    games = list_games(uid)
+    cheats = list_cheats(uid, gidx)
+    names = list_names(uid, gidx, cidx)
+    if not games or not cheats or not names:
+        return await c.answer("Не найдено", show_alert=True)
+
+    game = games[gidx]
+    cheat = cheats[cidx]
+    name = names[nidx]
+    t = tpls_of(uid)[game][cheat][name]
     text = t.get("text", "")
     photo = t.get("photo")
     buttons = t.get("buttons", [])
@@ -551,22 +679,33 @@ async def tpl_send(c: CallbackQuery):
             await bot.send_photo(chat_id=ch, photo=photo, caption=text, reply_markup=kb)
         else:
             await bot.send_message(chat_id=ch, text=text, reply_markup=kb)
+        log_action(uid, f'Отправил шаблон "{game} / {cheat} / {name}" в свой канал')
         await c.answer("✅ Отправлено в твой канал!", show_alert=True)
     except Exception as e:
         await c.answer(f"❌ Ошибка: {e}", show_alert=True)
 
+@dp.callback_query(F.data.startswith("tpl:back:templates#"))
+async def back_to_templates(c: CallbackQuery):
+    try:
+        gidx = int(c.data.split("#")[1])
+        cidx = int(c.data.split("#")[2])
+    except Exception:
+        return await c.answer("Некорректные данные", show_alert=True)
+    await safe_edit_text(c.message, "💾 Выбери шаблон:", reply_markup=names_menu(c.from_user.id, gidx, cidx))
+    await c.answer()
 
-# ----------------------------- УПРАВЛЕНИЕ ШАБЛОНАМИ ----------------------------- #
+
+# ----------------------------- УПРАВЛЕНИЕ ШАБЛОНАМИ (персональные) ----------------------------- #
 
 @dp.callback_query(F.data == "menu:manage")
 async def manage_root(c: CallbackQuery):
     await safe_edit_text(c.message, "🧩 Управление шаблонами:", reply_markup=manage_menu())
     await c.answer()
 
-# Добавление
 @dp.callback_query(F.data == "m:add")
 async def m_add_start(c: CallbackQuery, state: FSMContext):
     await state.set_state(ManageTemplateStates.ADD_GAME)
+    await state.update_data(uid=c.from_user.id)
     await safe_edit_text(c.message, "🎮 Введи название игры:", reply_markup=back_menu_kb())
     await c.answer()
 
@@ -662,23 +801,26 @@ async def m_btn_menu(c: CallbackQuery, state: FSMContext):
 
 async def finalize_template(state: FSMContext, matrix: List[List[Dict[str, str]]]):
     data = await state.get_data()
+    uid = int(data["uid"])
     game, cheat, name = data["game"], data["cheat"], data["name"]
     text, photo = data["text"], data.get("photo")
-    storage.setdefault("templates", {}).setdefault(game, {}).setdefault(cheat, {})[name] = {
+    tpls = tpls_of(uid)
+    tpls.setdefault(game, {}).setdefault(cheat, {})[name] = {
         "text": text,
         "photo": photo,
         "buttons": matrix
     }
     save_storage(storage)
+    log_action(uid, f'Создал/обновил шаблон "{game} / {cheat} / {name}"')
     await state.clear()
 
-# ----------------------------- УДАЛЕНИЕ ШАБЛОНОВ (с пагинацией) ----------------------------- #
-PAGE_SIZE = 20  # сколько шаблонов показывать на странице
+# удаление (пагинация)
+PAGE_SIZE = 20
 pending_deletes: Dict[int, List[Tuple[str, str, str]]] = {}
 
-def _collect_templates_flat() -> List[Tuple[str, str, str]]:
+def _collect_templates_flat(uid: int) -> List[Tuple[str, str, str]]:
     out: List[Tuple[str, str, str]] = []
-    tpls = storage.get("templates", {})
+    tpls = tpls_of(uid)
     for g, cheats in tpls.items():
         for ch, names in cheats.items():
             for n in names.keys():
@@ -695,7 +837,7 @@ def _delete_menu_page(user_id: int, page: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for idx in range(start, end):
         g, ch, n = items[idx]
-        kb.button(text=f"{g} / {ch} / {n}", callback_data=f"m:delete:{idx}")
+        kb.button(text=f"{g} / {ch} / {n}"[:64], callback_data=f"m:delete:{idx}")
     nav = InlineKeyboardBuilder()
     if page > 0:
         nav.button(text="⬅️ Назад", callback_data=f"m:delp:{page-1}")
@@ -704,15 +846,13 @@ def _delete_menu_page(user_id: int, page: int) -> InlineKeyboardMarkup:
         nav.button(text="Вперёд ➡️", callback_data=f"m:delp:{page+1}")
     exit_kb = InlineKeyboardBuilder()
     exit_kb.button(text="🏁 Выйти", callback_data="menu:manage")
-    kb.adjust(1)
-    nav.adjust(3)
-    exit_kb.adjust(1)
+    kb.adjust(1); nav.adjust(3); exit_kb.adjust(1)
     full = InlineKeyboardMarkup(inline_keyboard=[*kb.export(), *nav.export(), *exit_kb.export()])
     return full
 
 @dp.callback_query(F.data == "m:del")
 async def delete_template_start(c: CallbackQuery):
-    items = _collect_templates_flat()
+    items = _collect_templates_flat(c.from_user.id)
     if not items:
         return await c.answer("📂 Нет сохранённых шаблонов", show_alert=True)
     pending_deletes[c.from_user.id] = items
@@ -730,7 +870,7 @@ async def delete_template_page(c: CallbackQuery):
     except Exception:
         page = 0
     if c.from_user.id not in pending_deletes:
-        pending_deletes[c.from_user.id] = _collect_templates_flat()
+        pending_deletes[c.from_user.id] = _collect_templates_flat(c.from_user.id)
     await safe_edit_text(
         c.message,
         f"🗑 Выбери шаблон для удаления:\nВсего: <b>{len(pending_deletes[c.from_user.id])}</b>",
@@ -747,18 +887,20 @@ async def delete_template_confirm(c: CallbackQuery):
         return await c.answer("❌ Неверный индекс", show_alert=True)
     if idx < 0 or idx >= len(items):
         return await c.answer("❌ Элемент не найден (возможно список изменился)", show_alert=True)
+    uid = c.from_user.id
     g, ch, n = items[idx]
     try:
-        del storage["templates"][g][ch][n]
-        if not storage["templates"][g][ch]:
-            del storage["templates"][g][ch]
-        if not storage["templates"][g]:
-            del storage["templates"][g]
+        del tpls_of(uid)[g][ch][n]
+        if not tpls_of(uid)[g][ch]:
+            del tpls_of(uid)[g][ch]
+        if not tpls_of(uid)[g]:
+            del tpls_of(uid)[g]
         save_storage(storage)
+        log_action(uid, f'Удалил шаблон "{g} / {ch} / {n}"')
     except KeyError:
         pass
-    items = _collect_templates_flat()
-    pending_deletes[c.from_user.id] = items
+    items = _collect_templates_flat(uid)
+    pending_deletes[uid] = items
     await c.answer("✅ Шаблон удалён", show_alert=True)
     page = (idx // PAGE_SIZE) if items else 0
     max_page = max(0, (max(len(items), 1) - 1) // PAGE_SIZE)
@@ -766,12 +908,13 @@ async def delete_template_confirm(c: CallbackQuery):
     await safe_edit_text(
         c.message,
         f"🧩 Управление шаблонами — удаление\nОсталось: <b>{len(items)}</b>",
-        reply_markup=_delete_menu_page(c.from_user.id, page=page)
+        reply_markup=_delete_menu_page(uid, page=page)
     )
 
 @dp.callback_query(F.data == "m:list")
 async def list_templates(c: CallbackQuery):
-    tpls = storage.get("templates", {})
+    uid = c.from_user.id
+    tpls = tpls_of(uid)
     if not tpls:
         return await c.answer("📂 Нет сохранённых шаблонов", show_alert=True)
 
@@ -797,9 +940,10 @@ async def list_templates(c: CallbackQuery):
 async def m_export(c: CallbackQuery):
     if not admin_only(c.from_user.id):
         return await c.answer("⛔️ Доступ только для админов.", show_alert=True)
-    payload = json.dumps(storage.get("templates", {}), ensure_ascii=False, indent=2).encode("utf-8")
+    payload = json.dumps(tpls_of(c.from_user.id), ensure_ascii=False, indent=2).encode("utf-8")
     doc = BufferedInputFile(payload, filename="templates_export.json")
-    await c.message.answer_document(document=doc, caption="📦 Экспорт шаблонов (JSON).")
+    await c.message.answer_document(document=doc, caption="📦 Экспорт твоих шаблонов (JSON).")
+    log_action(c.from_user.id, "Экспортировал свои шаблоны")
     await c.answer()
 
 @dp.callback_query(F.data == "m:import")
@@ -823,11 +967,11 @@ async def m_import_file(m: Message, state: FSMContext):
             return await m.answer("❌ Неверный формат: нужен объект {game: {cheat: {name: {...}}}}")
 
         merged = 0
-        templates = storage.setdefault("templates", {})
+        tpls = tpls_of(m.from_user.id)
         for game, cheats in incoming.items():
             if not isinstance(cheats, dict):
                 continue
-            g = templates.setdefault(game, {})
+            g = tpls.setdefault(game, {})
             for cheat, names in cheats.items():
                 if not isinstance(names, dict):
                     continue
@@ -842,6 +986,7 @@ async def m_import_file(m: Message, state: FSMContext):
                     merged += 1
 
         save_storage(storage)
+        log_action(m.from_user.id, f"Импортировал шаблоны (штук: {merged})")
         await state.clear()
         await m.answer(f"✅ Импорт завершён. Шаблонов добавлено/обновлено: <b>{merged}</b>.")
     except Exception as e:
@@ -866,6 +1011,7 @@ async def set_clear(c: CallbackQuery):
     storage.setdefault("channels", {}).pop(key, None)
     storage.setdefault("channel_titles", {}).pop(key, None)
     save_storage(storage)
+    log_action(c.from_user.id, "Отвязал свой канал")
     await safe_edit_text(c.message, "Канал очищен.", reply_markup=settings_menu_kb(c.from_user.id))
     await c.answer()
 
@@ -911,6 +1057,7 @@ async def get_channel_from_forward(m: Message, state: FSMContext):
         storage.setdefault("channels", {})[key] = ch_id
         storage.setdefault("channel_titles", {})[key] = label
         save_storage(storage)
+        log_action(m.from_user.id, f'Подключил канал "{title}" ({ch_id})')
         await state.clear()
         await m.answer(
             f"✅ Канал подключён: <b>{html.escape(title)}</b> (<code>{ch_id}</code>)",
@@ -945,6 +1092,7 @@ async def get_channel_from_username(m: Message, state: FSMContext):
         storage.setdefault("channels", {})[key] = ch_id
         storage.setdefault("channel_titles", {})[key] = label
         save_storage(storage)
+        log_action(m.from_user.id, f'Подключил канал "{title}" ({ch_id}) через @username')
         await state.clear()
         await m.answer(
             f"✅ Канал подключён: <b>{html.escape(title)}</b> (<code>{ch_id}</code>)\n"
@@ -955,7 +1103,17 @@ async def get_channel_from_username(m: Message, state: FSMContext):
         await m.answer(f"❌ Не удалось получить канал: {e}", reply_markup=back_menu_kb())
 
 
-# ----------------------------- ВЛАДЕЛЕЦ: ПАНЕЛЬ ----------------------------- #
+# ----------------------------- ВЛАДЕЛЕЦ: ПАНЕЛЬ и АУДИТ ----------------------------- #
+
+async def get_user_display_for_panel(uid: int) -> str:
+    try:
+        chat: Chat = await bot.get_chat(uid)
+        name = html.escape(chat.full_name or str(uid))
+        if chat.username:
+            return f'<a href="https://t.me/{chat.username}">{name}</a>'
+        return f'<a href="tg://user?id={uid}">{name}</a>'
+    except Exception:
+        return f'<a href="tg://user?id={uid}">{uid}</a>'
 
 @dp.callback_query(F.data == "owner:panel")
 async def owner_panel(c: CallbackQuery):
@@ -967,7 +1125,7 @@ async def owner_panel(c: CallbackQuery):
 
     lines: List[str] = []
     for uid in admins:
-        user_html, _ = await get_user_display(uid)
+        user_html = await get_user_display_for_panel(uid)
         tag = " (OWNER)" if uid == OWNER_ID else ""
         ch_id = channels.get(str(uid))
         if ch_id:
@@ -982,9 +1140,26 @@ async def owner_panel(c: CallbackQuery):
     kb.button(text="👤 Добавить админа", callback_data="set:add_admin")
     kb.button(text="🗑 Удалить админа", callback_data="set:del_admin")
     kb.button(text="📜 Список админов", callback_data="set:list_admins")
+    kb.button(text="🧾 Аудит-лог", callback_data="owner:audit")  # NEW
     kb.button(text="⬅️ В меню", callback_data="menu:back")
-    kb.adjust(2, 2)
+    kb.adjust(2, 2, 1, 1)
     await safe_edit_text(c.message, text, reply_markup=kb.as_markup())
+    await c.answer()
+
+@dp.callback_query(F.data == "owner:audit")
+async def owner_audit(c: CallbackQuery):
+    if not is_owner(c.from_user.id):
+        return await c.answer("Только для владельца", show_alert=True)
+    lines = tail_audit(20)
+    if not lines:
+        return await c.message.answer("🧾 Лог пуст.")
+    body = "\n".join(lines)
+    # чтобы не упереться в лимиты, отправим документ если слишком длинно
+    if len(body) > 3500:
+        doc = BufferedInputFile(body.encode("utf-8"), filename="audit_last_20.txt")
+        await c.message.answer_document(document=doc, caption="🧾 Последние 20 действий")
+    else:
+        await c.message.answer(f"🧾 <b>Последние 20 действий</b>\n<pre>{html.escape(body)}</pre>")
     await c.answer()
 
 @dp.callback_query(F.data == "set:add_admin")
@@ -1007,6 +1182,7 @@ async def add_admin(m: Message, state: FSMContext):
     admins.add(uid)
     storage["admins"] = sorted(list(admins))
     save_storage(storage)
+    log_action(m.from_user.id, f"Добавил админа {uid}")
     await state.clear()
     await m.answer("✅ Админ добавлен.", reply_markup=main_menu_kb(m.from_user.id))
 
@@ -1033,6 +1209,7 @@ async def del_admin(m: Message, state: FSMContext):
         admins.remove(uid)
         storage["admins"] = sorted(list(admins))
         save_storage(storage)
+        log_action(m.from_user.id, f"Удалил админа {uid}")
         msg = "🗑 Админ удалён."
     else:
         msg = "Такого админа нет."
@@ -1049,7 +1226,7 @@ async def list_admins(c: CallbackQuery):
 
     lines: List[str] = []
     for uid in admins:
-        user_html, _ = await get_user_display(uid)
+        user_html = await get_user_display_for_panel(uid)
         tag = " (OWNER)" if uid == OWNER_ID else ""
         ch_id = channels.get(str(uid))
         if ch_id:
@@ -1067,9 +1244,10 @@ async def list_admins(c: CallbackQuery):
 
 async def main():
     if not BOT_TOKEN:
-        raise RuntimeError("❌ Укажи BOT_TOKEN в .env")
+        raise RuntimeError("❌ Укажи BOT_TOKEN (или TELEGRAM_BOT_TOKEN) в .env")
     print("✅ Bot started")
     print(f"🗂 storage.json path: {STORAGE_FILE}")
+    print(f"🧾 audit.log path:   {AUDIT_FILE}")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
