@@ -29,7 +29,7 @@ python -m venv .venv
 # Windows PowerShell:
 .\.venv\Scripts\Activate.ps1
 # Linux/macOS:
-source .venv/bin/activate
+source .venv/bin/activate ```
 
 pip install -r requirements.txt
 cp .env.example .env
@@ -97,3 +97,4 @@ Windows PowerShell ругается на скрипты — Set-ExecutionPolicy 
 
 📝 Лицензия
 Этот проект распространяется под лицензией MIT License.
+
