@@ -1,3 +1,4 @@
+
 """
 Телеграм-бот для постинга в КАНАЛ:
 - Роли: Владелец (OWNER) и админы.
@@ -118,6 +119,65 @@ def tail_audit(n: int = 20) -> List[str]:
         return []
 
 
+# ----------------------------- HELPERS: URL, FINGERPRINT, ADMIN CHECKS ----------------------------- #
+from urllib.parse import urlparse
+import hashlib as _hashlib
+import re as _re
+
+async def user_is_admin(chat_id: int, user_id: int) -> bool:
+    try:
+        admins = await bot.get_chat_administrators(chat_id)
+        return any(a.user.id == user_id for a in admins)
+    except Exception:
+        return False
+
+async def bot_is_admin(chat_id: int) -> bool:
+    try:
+        me = await bot.get_me()
+        admins = await bot.get_chat_administrators(chat_id)
+        return any(a.user.id == me.id for a in admins)
+    except Exception:
+        return False
+
+def is_http_url(s: str) -> bool:
+    try:
+        u = urlparse((s or '').strip())
+        return u.scheme in ('http', 'https') and bool(u.netloc)
+    except Exception:
+        return False
+
+def _norm_text(s: str) -> str:
+    if not s: return ''
+    return _re.sub(r'\s+', ' ', s).strip()
+
+def _norm_buttons(matrix):
+    if not matrix: return []
+    out = []
+    for row in matrix:
+        out.append([{'t': _norm_text(btn.get('t')), 'u': (btn.get('u') or '').strip()} for btn in row])
+    return out
+
+def template_fingerprint(payload: dict) -> str:
+    base = {
+        'text': _norm_text(payload.get('text')),
+        'photo': payload.get('photo') or '',
+        'buttons': _norm_buttons(payload.get('buttons')),
+    }
+    raw = json.dumps(base, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+    return _hashlib.sha256(raw.encode('utf-8')).hexdigest()
+
+def has_duplicate_template(uid: int, fp: str) -> bool:
+    tpls = tpls_of(uid)
+    for g, cheats in tpls.items():
+        for c, names in cheats.items():
+            for n, tpl in names.items():
+                try:
+                    if template_fingerprint(tpl) == fp:
+                        return True
+                except Exception:
+                    continue
+    return False
+
 # ----------------------------- МОДЕЛИ ----------------------------- #
 
 @dataclass
@@ -207,24 +267,6 @@ user_drafts: Dict[int, Draft] = {}
 
 
 # ----------------------------- УТИЛИТЫ ----------------------------- #
-# --- Правовой чекер: админство пользователя и бота в канале/группе ---
-async def user_is_admin(chat_id: int, user_id: int) -> bool:
-    """Проверяет, является ли указанный пользователь администратором чата/канала."""
-    try:
-        admins = await bot.get_chat_administrators(chat_id)
-        return any(a.user.id == user_id for a in admins)
-    except Exception:
-        return False
-
-async def bot_is_admin(chat_id: int) -> bool:
-    """Проверяет, имеет ли сам бот админ-права в чате/канале."""
-    try:
-        me = await bot.get_me()
-        admins = await bot.get_chat_administrators(chat_id)
-        return any(a.user.id == me.id for a in admins)
-    except Exception:
-        return False
-
 
 def is_owner(uid: int) -> bool:
     return OWNER_ID and uid == OWNER_ID
@@ -529,7 +571,10 @@ async def add_btn_text(m: Message, state: FSMContext):
 @dp.message(ComposeStates.ADD_BUTTON_URL)
 async def add_btn_url(m: Message, state: FSMContext):
     url = (m.text or "").strip()
-    if not (url.startswith("http://") or url.startswith("https://")):
+    # автодобавление схемы для t.me/* и подобных
+    if url.startswith("t.me/") or url.startswith("telegram.me/") or url.startswith("telegram.dog/"):
+        url = "https://" + url
+    if not is_http_url(url):
         return await m.answer("❌ URL должен начинаться с http:// или https://")
     data = await state.get_data()
     text = data.get("btn_text", "")
@@ -822,12 +867,14 @@ async def finalize_template(state: FSMContext, matrix: List[List[Dict[str, str]]
     uid = int(data["uid"])
     game, cheat, name = data["game"], data["cheat"], data["name"]
     text, photo = data["text"], data.get("photo")
+    payload = {"text": text, "photo": photo, "buttons": matrix}
+    fp = template_fingerprint(payload)
+    if has_duplicate_template(uid, fp):
+        # дубликат — не сохраняем
+        await state.clear()
+        return
     tpls = tpls_of(uid)
-    tpls.setdefault(game, {}).setdefault(cheat, {})[name] = {
-        "text": text,
-        "photo": photo,
-        "buttons": matrix
-    }
+    tpls.setdefault(game, {}).setdefault(cheat, {})[name] = payload
     save_storage(storage)
     log_action(uid, f'Создал/обновил шаблон "{game} / {cheat} / {name}"')
     await state.clear()
@@ -997,10 +1044,14 @@ async def m_import_file(m: Message, state: FSMContext):
                 for name, payload in names.items():
                     if not isinstance(payload, dict):
                         continue
-                    text = payload.get("text", "")
-                    photo = payload.get("photo")
-                    buttons = payload.get("buttons", [])
-                    ch[name] = {"text": text, "photo": photo, "buttons": buttons}
+                    text = payload.get('text', '')
+                    photo = payload.get('photo')
+                    buttons = payload.get('buttons', [])
+                    new_payload = {'text': text, 'photo': photo, 'buttons': buttons}
+                    fp = template_fingerprint(new_payload)
+                    if has_duplicate_template(m.from_user.id, fp):
+                        continue
+                    ch[name] = new_payload
                     merged += 1
 
         save_storage(storage)
@@ -1072,27 +1123,19 @@ async def get_channel_from_forward(m: Message, state: FSMContext):
         ch_id = m.forward_from_chat.id
         title = (m.forward_from_chat.title or "Канал").strip()
         label = f"{title} ({ch_id})"
-
-        # ✅ Пользователь должен быть админом указанного канала
+        # чекер: пользователь должен быть админом канала
         if not await user_is_admin(ch_id, m.from_user.id):
-            return await m.answer(
-                "⛔️ Ты не админ этого канала — подключение запрещено.",
-                reply_markup=back_menu_kb()
-            )
-
-        # Доп. проверка прав бота (не блокируем сохранение, но предупреждаем)
-        if not await bot_is_admin(ch_id):
-            warn = "⚠️ Бот не админ в канале — публикация не сработает, пока не выдашь права боту."
-        else:
-            warn = "✅ Бот имеет права в канале."
-
+            return await m.answer("⛔️ Ты не админ этого канала — подключение запрещено.", reply_markup=back_menu_kb())
         storage.setdefault("channels", {})[key] = ch_id
         storage.setdefault("channel_titles", {})[key] = label
         save_storage(storage)
         log_action(m.from_user.id, f'Подключил канал "{title}" ({ch_id})')
         await state.clear()
+        warn = ""
+        if not await bot_is_admin(ch_id):
+            warn = "\n⚠️ Бот не админ в канале — выдайте права, чтобы постить."
         await m.answer(
-            f"✅ Канал подключён: <b>{html.escape(title)}</b> (<code>{ch_id}</code>)\n{warn}",
+            f"✅ Канал подключён: <b>{html.escape(title)}</b> (<code>{ch_id}</code>){warn}",
             reply_markup=settings_menu_kb(m.from_user.id)
         )
     else:
@@ -1117,32 +1160,22 @@ async def get_channel_from_username(m: Message, state: FSMContext):
         chat: Chat = await bot.get_chat(username)
         if chat.type != ChatType.CHANNEL:
             return await m.answer("Это не канал. Укажи @username именно канала.", reply_markup=back_menu_kb())
-
+        key = str(m.from_user.id)
         ch_id = chat.id
         title = (chat.title or "Канал").strip()
         label = f"{title} ({ch_id})"
-
-        # ✅ Пользователь должен быть админом указанного канала
         if not await user_is_admin(ch_id, m.from_user.id):
-            return await m.answer(
-                "⛔️ Ты не админ этого канала — подключение запрещено.",
-                reply_markup=back_menu_kb()
-            )
-
-        # Доп. проверка прав бота (не блокируем сохранение, но предупреждаем)
-        if not await bot_is_admin(ch_id):
-            warn = "⚠️ Бот не админ в канале — публикация не сработает, пока не выдашь права боту."
-        else:
-            warn = "✅ Бот имеет права в канале."
-
-        key = str(m.from_user.id)
+            return await m.answer("⛔️ Ты не админ этого канала — подключение запрещено.", reply_markup=back_menu_kb())
         storage.setdefault("channels", {})[key] = ch_id
         storage.setdefault("channel_titles", {})[key] = label
         save_storage(storage)
         log_action(m.from_user.id, f'Подключил канал "{title}" ({ch_id}) через @username')
         await state.clear()
+        warn = ""
+        if not await bot_is_admin(ch_id):
+            warn = "\n⚠️ Бот не админ в канале — выдайте права, чтобы постить."
         await m.answer(
-            f"✅ Канал подключён: <b>{html.escape(title)}</b> (<code>{ch_id}</code>)\n{warn}",
+            f"✅ Канал подключён: <b>{html.escape(title)}</b> (<code>{ch_id}</code>){warn}",
             reply_markup=settings_menu_kb(m.from_user.id)
         )
     except Exception as e:
