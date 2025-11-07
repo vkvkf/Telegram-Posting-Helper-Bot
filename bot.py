@@ -207,6 +207,24 @@ user_drafts: Dict[int, Draft] = {}
 
 
 # ----------------------------- УТИЛИТЫ ----------------------------- #
+# --- Правовой чекер: админство пользователя и бота в канале/группе ---
+async def user_is_admin(chat_id: int, user_id: int) -> bool:
+    """Проверяет, является ли указанный пользователь администратором чата/канала."""
+    try:
+        admins = await bot.get_chat_administrators(chat_id)
+        return any(a.user.id == user_id for a in admins)
+    except Exception:
+        return False
+
+async def bot_is_admin(chat_id: int) -> bool:
+    """Проверяет, имеет ли сам бот админ-права в чате/канале."""
+    try:
+        me = await bot.get_me()
+        admins = await bot.get_chat_administrators(chat_id)
+        return any(a.user.id == me.id for a in admins)
+    except Exception:
+        return False
+
 
 def is_owner(uid: int) -> bool:
     return OWNER_ID and uid == OWNER_ID
@@ -1054,13 +1072,27 @@ async def get_channel_from_forward(m: Message, state: FSMContext):
         ch_id = m.forward_from_chat.id
         title = (m.forward_from_chat.title or "Канал").strip()
         label = f"{title} ({ch_id})"
+
+        # ✅ Пользователь должен быть админом указанного канала
+        if not await user_is_admin(ch_id, m.from_user.id):
+            return await m.answer(
+                "⛔️ Ты не админ этого канала — подключение запрещено.",
+                reply_markup=back_menu_kb()
+            )
+
+        # Доп. проверка прав бота (не блокируем сохранение, но предупреждаем)
+        if not await bot_is_admin(ch_id):
+            warn = "⚠️ Бот не админ в канале — публикация не сработает, пока не выдашь права боту."
+        else:
+            warn = "✅ Бот имеет права в канале."
+
         storage.setdefault("channels", {})[key] = ch_id
         storage.setdefault("channel_titles", {})[key] = label
         save_storage(storage)
         log_action(m.from_user.id, f'Подключил канал "{title}" ({ch_id})')
         await state.clear()
         await m.answer(
-            f"✅ Канал подключён: <b>{html.escape(title)}</b> (<code>{ch_id}</code>)",
+            f"✅ Канал подключён: <b>{html.escape(title)}</b> (<code>{ch_id}</code>)\n{warn}",
             reply_markup=settings_menu_kb(m.from_user.id)
         )
     else:
@@ -1085,18 +1117,32 @@ async def get_channel_from_username(m: Message, state: FSMContext):
         chat: Chat = await bot.get_chat(username)
         if chat.type != ChatType.CHANNEL:
             return await m.answer("Это не канал. Укажи @username именно канала.", reply_markup=back_menu_kb())
-        key = str(m.from_user.id)
+
         ch_id = chat.id
         title = (chat.title or "Канал").strip()
         label = f"{title} ({ch_id})"
+
+        # ✅ Пользователь должен быть админом указанного канала
+        if not await user_is_admin(ch_id, m.from_user.id):
+            return await m.answer(
+                "⛔️ Ты не админ этого канала — подключение запрещено.",
+                reply_markup=back_menu_kb()
+            )
+
+        # Доп. проверка прав бота (не блокируем сохранение, но предупреждаем)
+        if not await bot_is_admin(ch_id):
+            warn = "⚠️ Бот не админ в канале — публикация не сработает, пока не выдашь права боту."
+        else:
+            warn = "✅ Бот имеет права в канале."
+
+        key = str(m.from_user.id)
         storage.setdefault("channels", {})[key] = ch_id
         storage.setdefault("channel_titles", {})[key] = label
         save_storage(storage)
         log_action(m.from_user.id, f'Подключил канал "{title}" ({ch_id}) через @username')
         await state.clear()
         await m.answer(
-            f"✅ Канал подключён: <b>{html.escape(title)}</b> (<code>{ch_id}</code>)\n"
-            f"Если отправка не идёт — назначь бота админом в канале.",
+            f"✅ Канал подключён: <b>{html.escape(title)}</b> (<code>{ch_id}</code>)\n{warn}",
             reply_markup=settings_menu_kb(m.from_user.id)
         )
     except Exception as e:
